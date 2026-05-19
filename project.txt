@@ -1,0 +1,572 @@
+Multi-Agent Chatbot Application
+1. Overview & Purpose
+This document defines the functional requirements for a multi-agent AI chatbot application. It is intended as a hands-on reference for engineers new to building with large language models.
+
+The application demonstrates three interconnected patterns that together form a production-grade AI assistant:
+
+Multi-agent orchestration — a coordinator delegates tasks to specialized subagents
+Retrieval-Augmented Generation (RAG) — answers grounded in Vanguard's own documents
+Tool use and MCP server — the LLM triggers real actions (search, DB queries, email)
+ 
+
+1.1  Technology Baseline
+The reference implementation uses a single, consistent Python stack so the focus stays on agent design rather than language plumbing:
+
+Language: Python 3.11+ for every component — agents, MCP server, ingestion pipeline, and tests.
+Orchestration: LangGraph is required. The coordinator and subagents are implemented as nodes in a StateGraph, connected by conditional edges. State is a TypedDict (use Annotated with reducers like add_messages where fields should accumulate rather than overwrite).
+Vector store: ChromaDB (local, runs in Docker or in-process).
+MCP server: Python process built on the mcp package (no Node.js).
+Validation: Pydantic models are used only at LLM and config boundaries — tool inputs, structured LLM outputs (e.g. routing decisions), and configuration. Graph state itself is a plain TypedDict, not a Pydantic model.
+ 
+
+1.2  Pluggability Requirement
+The solution must be built so that the LLM provider and the vector database can be swapped without rewriting agent or pipeline code. Concretely:
+
+LLM behind an interface. All LLM calls go through a single LangChain BaseChatModel reference (e.g. ChatAnthropic, ChatBedrockConverse, or AzureChatOpenAI). Agent code never imports a provider SDK directly. Switching from Anthropic to Bedrock to Azure must be a config change, not a refactor.
+Vector store behind an interface. Retrieval goes through a LangChain VectorStore + BaseRetriever abstraction. Replacing ChromaDB with Pinecone, pgvector, or another store must require changing only the factory that constructs the store, never the agents that consume it.
+Embeddings behind an interface. Same pattern — a LangChain Embeddings instance is constructed once and injected wherever embeddings are needed.
+Configuration is typed. A Pydantic BaseSettings class (loaded from environment variables) selects the LLM provider, model id, embedding provider, and vector store backend at startup.
+ 
+
+1.3  What This Is Not
+This spec does not cover model fine-tuning, infrastructure provisioning, or UI/UX design. It covers application logic only.
+
+2. System Architecture
+The system follows an orchestrator-subagent pattern implemented as a LangGraph StateGraph. A single Coordinator node receives every user message. Based on intent, a conditional edge routes the conversation to one of three Subagent nodes. Each subagent has a distinct system prompt and a limited toolset.
+
+ 
+
+2.1  Agent Roster
+Agent
+
+Role
+
+Scope
+
+Coordinator
+
+Orchestrator (LangGraph entry node)
+
+Classifies intent, selects subagent, maintains conversation state, summarizes final answer
+
+Support Agent
+
+Subagent 1 (LangGraph node)
+
+Handles FAQ, policy questions, account inquiries — uses RAG over the Vanguard knowledge base
+
+Research Agent
+
+Subagent 2 (LangGraph node)
+
+Handles market/fund research — uses web_search and internal DB query tools
+
+Action Agent
+
+Subagent 3 (LangGraph node)
+
+Executes tasks: sends emails, creates tickets, logs actions — uses MCP-wrapped tools
+
+ 
+
+2.2  Message Flow
+Every user message follows this path through the graph:
+
+User message arrives at the application layer and is appended to the LangGraph state
+The graph is invoked starting at the Coordinator node with the full state
+Coordinator emits a structured routing decision (Pydantic RoutingDecision model)
+A conditional edge routes the state to the selected Subagent node
+Subagent responds, optionally triggering tools through its bound toolset (see Section 4)
+Tool results are appended to the subagent's messages and a final response is generated
+The graph returns final state; the application returns the subagent's response to the user
+ 
+
+2.3  State Schema
+Conversation and intermediate values flow through the graph as a single typed state object — a TypedDict. Fields that should accumulate across nodes (like messages) must be wrapped in Annotated[..., reducer]; otherwise each node return will overwrite the field. At minimum the state carries:
+
+from typing import Annotated, TypedDict
+
+from langgraph.graph.message import add_messages
+
+ 
+
+class ConversationState(TypedDict):
+
+    messages: Annotated[list[BaseMessage], add_messages]  # accumulates across nodes
+
+    user_message: str                               # current turn
+
+    routing: RoutingDecision | None              # set by coordinator (Pydantic model)
+
+    retrieved_chunks: list[RetrievedChunk]       # set by RAG step
+
+    tool_results: list[ToolResult]                # set by tool nodes
+
+    final_response: str | None                     # set by subagent
+
+No session state is stored server-side between turns — the graph is invoked fresh per request, with prior history loaded from the application layer. Conversation history must be trimmed to fit within the model context window (see Section 6.1).
+
+3. RAG-Based FAQ (Support Agent)
+The Support Agent grounds every answer in Vanguard's internal document corpus. It never answers from model memory alone.
+
+ 
+
+3.1  Document Pipeline
+Step
+
+Action
+
+Detail
+
+1
+
+Ingest
+
+Load PDFs, markdown, and HTML from the Vanguard knowledge base folder using LangChain document loaders
+
+2
+
+Chunk
+
+Split each document into 512-token overlapping chunks (50-token overlap) with a RecursiveCharacterTextSplitter
+
+3
+
+Embed
+
+Pass each chunk through the configured LangChain Embeddings implementation (provider chosen via config — see 1.2)
+
+4
+
+Store
+
+Upsert chunk text + metadata + embedding into ChromaDB through LangChain's Chroma vector store wrapper
+
+5
+
+Query
+
+At runtime, retrieve the top-5 most similar chunks via a BaseRetriever obtained from the vector store factory
+
+6
+
+Augment
+
+Inject retrieved chunks into the Support Agent's system prompt as context
+
+7
+
+Generate
+
+The LLM answers using only the provided context; cites source doc + chunk ID
+
+8
+
+Fallback
+
+If similarity score < 0.75 for all chunks, respond: 'I don't have that information in my knowledge base. Would you like me to escalate?'
+
+The retriever is consumed by the Support Agent node strictly through the BaseRetriever interface. Replacing ChromaDB with Pinecone or another backend must require changing only the vector store factory.
+
+ 
+
+3.2  Support Agent System Prompt Template
+You are the Vanguard Support Agent. Answer ONLY using the context below.
+
+If the answer is not in the context, say so explicitly.
+
+Always cite the source document name at the end of your answer.
+
+ 
+
+Context:
+
+{{retrieved_chunks}}
+
+ 
+
+User question: {{user_message}}
+
+ 
+
+3.3  Citation Format
+Every response must end with a Sources line:
+
+Sources: [Fund Prospectus Q1 2026, chunk_id: 142] [Advisor Policy v3.2, chunk_id: 89]
+
+4. Tool Triggers & MCP Server
+The Research and Action Agents are equipped with tools. The LLM emits tool_use blocks when it determines a tool is needed. The application executes the tool, appends the result as a tool_result block, and re-invokes the LLM to generate a final response. In LangGraph this loop is implemented as a tool node bound to the agent node.
+
+ 
+
+4.1  Tool Definitions
+Tool Name
+
+Agent
+
+Trigger Phrase Examples
+
+What It Does
+
+web_search
+
+Research
+
+"latest fund performance", "current rates"
+
+Performs a web search via a Python search client; returns top results
+
+db_query
+
+Research
+
+"show me holdings", "what did fund X return"
+
+Executes a read-only SQL query against the internal Vanguard data warehouse
+
+send_email
+
+Action
+
+"email the advisor", "notify the team"
+
+Sends an email via SendGrid API; requires recipient, subject, body
+
+create_ticket
+
+Action
+
+"open a ticket", "log this issue"
+
+Creates a Jira ticket; requires summary and description fields
+
+log_action
+
+Action
+
+"record that", "log this conversation"
+
+Writes a structured audit log entry to the internal logging service
+
+ 
+
+4.2  Tool Use Loop (Pseudocode)
+Conceptually the loop looks like the snippet below. In the real implementation it runs as a LangGraph agent node + tool node pair, with llm.bind_tools(tools) handling the schema wiring.
+
+llm = build_chat_model()           # provider chosen via config (1.2)
+
+llm_with_tools = llm.bind_tools(tools)  # tools defined as Pydantic models
+
+ 
+
+response = llm_with_tools.invoke(state.messages)
+
+ 
+
+while response.tool_calls:
+
+    for call in response.tool_calls:
+
+        result = execute_tool(call.name, call.args)
+
+        state.messages.append(ToolMessage(content=result, tool_call_id=call.id))
+
+    response = llm_with_tools.invoke(state.messages)
+
+ 
+
+return response.content  # final answer
+
+ 
+
+4.3  MCP Server Wrapper
+All tools above must be exposed through an MCP (Model Context Protocol) server so any MCP-aware client can consume them without re-implementing the logic.
+
+The MCP server is a Python process built on the mcp package and exposes a JSON-RPC 2.0 interface over stdio or HTTP/SSE.
+Each tool is registered with the MCP server using a Pydantic input model; the server derives the JSON Schema automatically from the model.
+The agent connects to the MCP server through LangChain's MCP client adapter and binds the discovered tools onto the LLM in the relevant LangGraph node.
+Authentication: MCP server validates a Bearer token on every inbound tool call.
+Errors: MCP server returns a structured error object; the LLM surfaces the error message to the user.
+ 
+
+4.4  MCP Tool Definition Example
+Tool inputs are declared as Pydantic models. The MCP server and any LangChain tool wrappers derive their schemas from the same model — one source of truth.
+
+class DbQueryInput(BaseModel):
+
+    """Run a read-only SQL query against the Vanguard data warehouse."""
+
+    sql: str = Field(..., description="A SELECT statement only.")
+
+ 
+
+@mcp_server.tool()
+
+def db_query(payload: DbQueryInput) -> DbQueryResult:
+
+    ...
+
+5. Coordinator Routing Logic
+The Coordinator must return a structured routing decision on every turn. It must not answer user questions directly — its only job is routing.
+
+ 
+
+5.1  Routing Decision Model
+The decision is a Pydantic model bound to the LLM via llm.with_structured_output(RoutingDecision). Invalid output is caught as a validation error rather than a parse-and-pray on raw text.
+
+class RoutingDecision(BaseModel):
+
+    agent: Literal["support", "research", "action"]
+
+    reason: str = Field(..., max_length=240)
+
+ 
+
+5.2  Coordinator System Prompt
+You are a routing coordinator. Your ONLY job is to decide which agent
+
+should handle the user message. Output ONLY a RoutingDecision. No prose.
+
+ 
+
+Agents available:
+
+  "support"  — policy, FAQ, account, document questions
+
+  "research" — market data, fund performance, live lookups
+
+  "action"   — send email, create ticket, log something
+
+ 
+
+5.3  Routing Decision Table
+User Intent Signal
+
+Route To
+
+Example Message
+
+Policy, rules, how-to, account help, FAQ
+
+support
+
+"What is Vanguard's fee structure?"
+
+Real-time data, performance, market info
+
+research
+
+"What did VFIAX return last quarter?"
+
+Send, email, notify, log, create, open ticket
+
+action
+
+"Email the advisor team about this."
+
+Ambiguous or multi-part intent
+
+support
+
+Default to support; support can re-route
+
+6. Non-Functional Requirements
+ 
+
+6.1  Context Window Management
+Max conversation history: 20 turns. Summarize and truncate older turns beyond this.
+RAG chunks injected per call: top-5, max 512 tokens each = 2,560 tokens of context.
+Reserved for system prompt + response: 4,000 tokens minimum.
+If total exceeds model limit, drop oldest turns first (keep system prompt and last 5 turns).
+ 
+
+6.2  Latency Targets
+Operation
+
+Target (p95)
+
+Coordinator routing decision
+
+< 1.5 seconds
+
+RAG retrieval (vector search)
+
+< 300 ms
+
+Support agent response (no tools)
+
+< 4 seconds
+
+Research agent response (with web_search)
+
+< 8 seconds
+
+Action agent response (with tool execution)
+
+< 6 seconds
+
+ 
+
+6.3  Safety & Guardrails
+The Coordinator must reject messages classified as harmful, off-topic, or adversarial before routing.
+No subagent may make destructive database operations — all DB tools are read-only.
+Action agent tools (send_email, create_ticket) must present a confirmation step before execution.
+All LLM calls must include a max_tokens cap of 1,024 for coordinator, 2,048 for subagents.
+PII detected in user messages must be masked before being written to logs.
+ 
+
+6.4  Error Handling
+Failure Mode
+
+Behavior
+
+LLM API timeout
+
+Retry up to 2x with exponential backoff (use tenacity); surface error to user after 3rd failure
+
+Tool execution error
+
+Append error as tool_result; LLM acknowledges failure and offers alternatives
+
+RAG retrieval returns 0 results
+
+Subagent falls back to 'I don't know' response; logs the query for review
+
+Coordinator returns invalid structured output
+
+Pydantic validation error; retry once with an explicit reminder; default to 'support' if still invalid
+
+MCP server unreachable
+
+Disable tool use for that session; notify user that live data is unavailable
+
+7. Builder Checklist
+Use this checklist to track implementation progress. Each item maps to a section of this spec.
+
+ 
+
+Done
+
+Task
+
+Ref
+
+☐
+
+Define typed configuration with Pydantic BaseSettings (LLM provider, model id, embedding provider, vector store backend)
+
+Sec 1.2
+
+☐
+
+Build LLM factory returning a LangChain BaseChatModel; agent code references only the interface
+
+Sec 1.2
+
+☐
+
+Build vector store factory returning a LangChain VectorStore / BaseRetriever (Chroma is the default backend)
+
+Sec 1.2, 3.1
+
+☐
+
+Define the LangGraph state schema as a TypedDict (ConversationState); use Annotated[..., add_messages] for the messages field
+
+Sec 2.3
+
+☐
+
+Build the LangGraph StateGraph: Coordinator node, three Subagent nodes, conditional edges
+
+Sec 2
+
+☐
+
+Implement Coordinator with with_structured_output(RoutingDecision)
+
+Sec 5
+
+☐
+
+Write system prompts for Support, Research, Action Agents
+
+Sec 2.1
+
+☐
+
+Build conversation history manager with 20-turn limit
+
+Sec 6.1
+
+☐
+
+Set up document ingestion pipeline (load → chunk → embed → upsert into ChromaDB)
+
+Sec 3.1
+
+☐
+
+Implement vector retrieval and chunk injection into Support Agent (via the retriever interface)
+
+Sec 3.1
+
+☐
+
+Add similarity-score threshold + 'I don't know' fallback
+
+Sec 3.1
+
+☐
+
+Define all tool inputs as Pydantic models; bind tools to the LLM with llm.bind_tools(...)
+
+Sec 4.1, 4.4
+
+☐
+
+Implement the LangGraph tool-execution loop (agent node + tool node)
+
+Sec 4.2
+
+☐
+
+Stand up Python MCP server (using the mcp package) and expose all tools
+
+Sec 4.3
+
+☐
+
+Connect the agents to the MCP server through LangChain's MCP client adapter
+
+Sec 4.3
+
+☐
+
+Add confirmation step before action agent executes send_email / create_ticket
+
+Sec 6.3
+
+☐
+
+Add error handling for all failure modes (use tenacity for retries)
+
+Sec 6.4
+
+☐
+
+Verify pluggability: swap LLM provider via config; swap vector store factory to a non-Chroma backend; agents must run unchanged
+
+Sec 1.2
+
+☐
+
+Load test against latency targets
+
+Sec 6.2
+
+☐
+
+PII masking before writing to logs
+
+Sec 6.3
